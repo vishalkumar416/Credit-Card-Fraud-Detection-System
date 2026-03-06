@@ -161,10 +161,11 @@ firestore_db = firestore.client()
 # MySQL Database
 def connect_db():
     return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="Hadoop@123",
-        database="credit_card_db"
+        host=os.getenv("MYSQLHOST"),
+        user=os.getenv("MYSQLUSER"),
+        password=os.getenv("MYSQLPASSWORD"),
+        database=os.getenv("MYSQLDATABASE"),
+        port=int(os.getenv("MYSQLPORT"))
     )
 
 def hash_password(password):
