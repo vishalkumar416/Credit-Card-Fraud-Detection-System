@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+Lib/
+Include/
+Scripts/
+share/
+pyvenv.cfg
+
+# Model extracted files
+model/
+
+# Environment
+.env
+
+# Firebase secrets
+firebase/*.json
+
+# OS
+.DS_Store
+Thumbs.db

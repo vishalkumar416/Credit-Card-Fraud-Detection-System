@@ -1,0 +1,8 @@
+streamlit
+mysql-connector-python
+firebase-admin
+google-auth-oauthlib
+requests
+numpy
+python-dotenv
+scikit-learn
