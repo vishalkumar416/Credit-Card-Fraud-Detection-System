@@ -46,7 +46,7 @@ box-sizing:border-box;margin-top:4px;margin-bottom:4px;
 
 # connect firebase
 firebase_config = {
-    "type": os.getenv("FIREBASE_TYPE"),
+    "type": os.getenv("FIREBASE_TYPE",""),
     "project_id": os.getenv("FIREBASE_PROJECT_ID"),
     "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
     "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n"),
