@@ -1,5 +1,4 @@
 import streamlit as st
-import mysql.connector
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google_auth_oauthlib.flow import Flow
@@ -22,8 +21,7 @@ load_dotenv()
 def check_required_env():
     required_keys = [
         "STRIPE_SECRET_KEY", "FIREBASE_TYPE", "FIREBASE_PROJECT_ID", 
-        "FIREBASE_PRIVATE_KEY_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL",
-        "DB_HOST", "DB_USER", "DB_NAME"
+        "FIREBASE_PRIVATE_KEY_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL"
     ]
     missing = [key for key in required_keys if not os.getenv(key)]
     return missing
@@ -159,42 +157,7 @@ def check_email_domain(email):
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def get_db_connection():
-    try:
-        conn = mysql.connector.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            user=os.getenv("DB_USER", "root"),
-            password=os.getenv("DB_PASSWORD", ""),
-            database=os.getenv("DB_NAME", "credit_card_db"),
-            autocommit=True
-        )
-        return conn
-    except mysql.connector.Error as err:
-        st.error(f"Error connecting to MySQL: {err}")
-        return None
-
-def init_db():
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT,
-                    stripe_session_id VARCHAR(255),
-                    amount DECIMAL(10,2),
-                    status VARCHAR(50),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
-            cursor.close()
-            conn.close()
-    except Exception as e:
-        st.warning(f"Database initialization delayed or failed: {e}")
-
-init_db()
+# Redundant DB functions removed
 
 
 def check_payment_status():
@@ -203,25 +166,17 @@ def check_payment_status():
         try:
             session = stripe.checkout.Session.retrieve(session_id)
             if session.payment_status == "paid":
-                # client_reference_id contains user_int_id
-                user_int_id = int(session.client_reference_id) if session.client_reference_id else None
-                conn = get_db_connection()
-                if conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT * FROM payments WHERE stripe_session_id = %s", (session_id,))
-                    if not cursor.fetchone():
-                        cursor.execute("INSERT INTO payments (user_id, stripe_session_id, amount, status) VALUES (%s, %s, %s, %s)",
-                                       (user_int_id, session_id, session.amount_total / 100.0, "paid"))
-                        conn.commit()
-                        firestore_db.collection("payments").add({
-                            "user_id": user_int_id,
-                            "stripe_session_id": session_id,
-                            "amount": session.amount_total / 100.0,
-                            "status": "paid",
-                            "created_at": datetime.utcnow()
-                        })
-                    cursor.close()
-                    conn.close()
+                # Check directly in Firestore
+                existing_payments = firestore_db.collection("payments").where("stripe_session_id", "==", session_id).get()
+                if not existing_payments:
+                    user_id = session.client_reference_id
+                    firestore_db.collection("payments").add({
+                        "user_id": user_id,
+                        "stripe_session_id": session_id,
+                        "amount": session.amount_total / 100.0,
+                        "status": "paid",
+                        "created_at": datetime.utcnow()
+                    })
                 st.session_state.payment_success = True
         except Exception as e:
             st.error(f"Error verifying payment: {e}")
@@ -254,28 +209,12 @@ def google_login_flow():
         users = firestore_db.collection("users").where("email", "==", email).get()
 
         if users:
-            # existing user, just grab their id and user_id
+            # existing user
             user_id = users[0].id
             user_name = users[0].to_dict()["name"]
-            user_int_id = users[0].to_dict().get("user_id")
         else:
-            # new user, insert into MySQL first to get id
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor()
-                sql = "INSERT INTO users (name, email, phone, password, role) VALUES (%s, %s, %s, %s, %s)"
-                val = (name, email, "", "", "user")
-                cursor.execute(sql, val)
-                user_int_id = cursor.lastrowid
-                conn.commit()
-                cursor.close()
-                conn.close()
-            else:
-                st.error("Could not connect to database")
-                st.stop()
-
-            doc = firestore_db.collection("users").add({
-                "user_id": user_int_id,
+            # new user - only Firestore
+            doc_ref = firestore_db.collection("users").add({
                 "name": name,
                 "email": email,
                 "phone": "",
@@ -283,12 +222,11 @@ def google_login_flow():
                 "role": "user",
                 "created_at": datetime.utcnow()
             })
-            user_id = doc[1].id
+            user_id = doc_ref[1].id
             user_name = name
 
         st.session_state.user_id = user_id
         st.session_state.user_name = user_name
-        st.session_state.user_int_id = user_int_id
         st.query_params.clear()
         st.rerun()
 
@@ -320,7 +258,6 @@ def home():
             if user.get("password") == hash_password(password):
                 st.session_state.user_id = users[0].id
                 st.session_state.user_name = user["name"]
-                st.session_state.user_int_id = user.get("user_id")
                 st.rerun()
             else:
                 st.error("Invalid credentials")
@@ -346,22 +283,7 @@ def register():
         if users:
             st.error("User already exists")
         else:
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor()
-                sql = "INSERT INTO users (name, email, phone, password, role) VALUES (%s, %s, %s, %s, %s)"
-                val = (name, email, phone, hash_password(password), "user")
-                cursor.execute(sql, val)
-                user_int_id = cursor.lastrowid
-                conn.commit()
-                cursor.close()
-                conn.close()
-            else:
-                st.error("Could not connect to database")
-                st.stop()
-
-            doc = firestore_db.collection("users").add({
-                "user_id": user_int_id,
+            doc_ref = firestore_db.collection("users").add({
                 "name": name,
                 "email": email,
                 "phone": phone,
@@ -391,37 +313,40 @@ def dashboard():
             st.session_state.view_history = False
             st.rerun()
             
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor(dictionary=True)
-            sql = "SELECT customer_id as user_id, amount, is_international as international, fraud_prediction as prediction, fraud_probability as risk_score, created_at FROM reports ORDER BY created_at DESC"
-            cursor.execute(sql)
-            history_data = cursor.fetchall()
-            cursor.close()
-            conn.close()
+        # Fetch from Firestore
+        reports_ref = firestore_db.collection("reports").order_by("created_at", direction=firestore.Query.DESCENDING).get()
+        history_data = [doc.to_dict() for doc in reports_ref]
 
-            if history_data:
-                st.dataframe(history_data, use_container_width=True)
-            else:
-                st.info("No prediction history found.")
+        if history_data:
+            # Map for display
+            display_data = []
+            for d in history_data:
+                display_data.append({
+                    "user_id": d.get("user_id"),
+                    "amount": d.get("amount"),
+                    "international": d.get("is_international"),
+                    "prediction": d.get("fraud_prediction"),
+                    "risk_score": d.get("fraud_probability"),
+                    "created_at": d.get("created_at")
+                })
+            st.dataframe(display_data, use_container_width=True)
         else:
-            st.error("Could not connect to database")
+            st.info("No prediction history found.")
     else:
-        # Check prediction limit and payment
+        # Check prediction limit and payment from Firestore
         can_predict = False
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM reports WHERE customer_id = %s", (st.session_state.get("user_int_id"),))
-            pred_count = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM payments WHERE user_id = %s AND status = 'paid'", (st.session_state.get("user_int_id"),))
-            payment_count = cursor.fetchone()[0]
-            cursor.close()
-            conn.close()
-            
-            if payment_count > 0 or pred_count < 3:
-                can_predict = True
+        user_id = st.session_state.get("user_id")
+        
+        # Count user's reports
+        pred_docs = firestore_db.collection("reports").where("user_id", "==", user_id).get()
+        pred_count = len(pred_docs)
+        
+        # Check if user has any 'paid' status in payments
+        payment_docs = firestore_db.collection("payments").where("user_id", "==", user_id).where("status", "==", "paid").get()
+        payment_count = len(payment_docs)
+        
+        if payment_count > 0 or pred_count < 3:
+            can_predict = True
 
         if not can_predict:
             st.warning("You have reached the free limit of 3 predictions. Please subscribe to continue.")
@@ -453,8 +378,7 @@ def dashboard():
                             mode='payment',
                             success_url=f'{BASE_URL}?session_id={{CHECKOUT_SESSION_ID}}',
                             cancel_url=BASE_URL,
-                            client_reference_id=str(st.session_state.get("user_int_id"))
-
+                            client_reference_id=str(st.session_state.get("user_id"))
                         )
                         st.markdown(f'<a href="{checkout_session.url}" target="_self" style="text-decoration:none;"><button style="width:100%;height:40px;border-radius:20px;border:none;background:linear-gradient(90deg,#5bc8d4,#b44fc8);color:white;font-weight:700;font-size:14px;cursor:pointer;">Subscribe</button></a>', unsafe_allow_html=True)
                     except Exception as e:
@@ -560,7 +484,7 @@ def dashboard():
 
             # save result to firestore
             firestore_db.collection("reports").add({
-                "user_id": st.session_state.get("user_int_id"),
+                "user_id": st.session_state.get("user_id"),
                 "amount": amount,
                 "is_international": international,
                 "fraud_prediction": final_label,
@@ -573,16 +497,7 @@ def dashboard():
                 "created_at": datetime.utcnow()
             })
 
-            # save result to MySQL
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor()
-                sql = "INSERT INTO reports (customer_id, amount, is_international, fraud_prediction, fraud_probability) VALUES (%s, %s, %s, %s, %s)"
-                val = (st.session_state.get("user_int_id"), amount, international, final_label, risk_score)
-                cursor.execute(sql, val)
-                conn.commit()
-                cursor.close()
-                conn.close()
+            # MySQL save removed
 
             st.success("Prediction: " + final_label)
             st.metric("Risk Score", str(risk_score) + "/100")
