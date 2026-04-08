@@ -11,6 +11,8 @@ pyvenv.cfg
 
 # Model extracted files
 model/
+model.zip
+*.csv
 
 # Environment
 .env

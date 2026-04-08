@@ -1,4 +1,5 @@
 import streamlit as st
+import mysql.connector
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google_auth_oauthlib.flow import Flow
@@ -8,12 +9,33 @@ import numpy as np
 import hashlib
 import os
 import zipfile
+import stripe
 from dotenv import load_dotenv
 from datetime import datetime
+import re
+import phonenumbers
+from email_validator import validate_email, EmailNotValidError
 
 load_dotenv()
 
+# --- CONFIGURATION & ENV CHECK ---
+def check_required_env():
+    required_keys = [
+        "STRIPE_SECRET_KEY", "FIREBASE_TYPE", "FIREBASE_PROJECT_ID", 
+        "FIREBASE_PRIVATE_KEY_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL",
+        "DB_HOST", "DB_USER", "DB_NAME"
+    ]
+    missing = [key for key in required_keys if not os.getenv(key)]
+    return missing
+
+missing_vars = check_required_env()
+
 st.set_page_config(page_title="Credit Card Fraud Detection", layout="centered")
+
+# Determine Base URL for redirects
+# On Render, we can use the environment variable RENDER_EXTERNAL_URL if set, or default to localhost
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8501").rstrip("/") + "/"
+
 
 # page styling
 st.markdown("""
@@ -44,12 +66,25 @@ box-sizing:border-box;margin-top:4px;margin-bottom:4px;
 </style>
 """, unsafe_allow_html=True)
 
+# Show error if env vars are missing
+if missing_vars:
+    st.error(f"⚠️ Missing Environment Variables: {', '.join(missing_vars)}")
+    st.info("Please set these variables in your Render Dashboard or .env file.")
+    if not os.getenv("RENDER_EXTERNAL_URL"): # Only stop if local and missing, or maybe just warn on Render
+        st.warning("The application may not function correctly.")
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
 # connect firebase
+firebase_key = os.getenv("FIREBASE_PRIVATE_KEY", "")
+if firebase_key:
+    firebase_key = firebase_key.replace("\\n", "\n")
+
 firebase_config = {
     "type": os.getenv("FIREBASE_TYPE",""),
     "project_id": os.getenv("FIREBASE_PROJECT_ID"),
     "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-    "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n"),
+    "private_key": firebase_key,
     "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
     "client_id": os.getenv("FIREBASE_CLIENT_ID"),
     "auth_uri": os.getenv("FIREBASE_AUTH_URI"),
@@ -58,11 +93,15 @@ firebase_config = {
     "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL")
 }
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate(firebase_config)
-    firebase_admin.initialize_app(cred)
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(firebase_config)
+        firebase_admin.initialize_app(cred)
+    firestore_db = firestore.client()
+except Exception as e:
+    st.error(f"Firebase Initialization Error: {e}")
+    firestore_db = None
 
-firestore_db = firestore.client()
 
 # load model and scaler
 if not os.path.exists("model"):
@@ -75,23 +114,131 @@ if not os.path.exists("model/model.pkl"):
 model = pickle.load(open("model/model.pkl", "rb"))
 scaler = pickle.load(open("model/scaler.pkl", "rb"))
 
+def is_luhn_valid(card_num):
+    card_num = str(card_num).replace(" ", "").replace("-", "")
+    if not card_num.isdigit():
+        return False
+    total = 0
+    reverse_digits = card_num[::-1]
+    for i, digit in enumerate(reverse_digits):
+        n = int(digit)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+def is_upi_valid(upi_id):
+    pattern = r"^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$"
+    return bool(re.match(pattern, upi_id))
+
+def is_phone_valid(phone):
+    try:
+        if len(phone) == 10 and phone.isdigit():
+            phone = "+91" + phone
+        elif not phone.startswith("+"):
+            phone = "+" + phone
+        parsed = phonenumbers.parse(phone)
+        return phonenumbers.is_valid_number(parsed)
+    except phonenumbers.NumberParseException:
+        return False
+
+def check_email_domain(email):
+    disposable_domains = ['mailinator.com', '10minutemail.com', 'guerrillamail.com', 'tempmail.com', 'yopmail.com']
+    try:
+        valid = validate_email(email)
+        domain = valid.domain
+        if domain in disposable_domains:
+            return False, "Disposable domain detected"
+        return True, "Valid email"
+    except EmailNotValidError as e:
+        return False, str(e)
+
 # hash password before saving
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# get next user_id by counting existing users (auto-increment, no counters collection)
-def get_next_user_id():
-    all_users = firestore_db.collection("users").get()
-    return len(all_users) + 1
+def get_db_connection():
+    try:
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD", ""),
+            database=os.getenv("DB_NAME", "credit_card_db"),
+            autocommit=True
+        )
+        return conn
+    except mysql.connector.Error as err:
+        st.error(f"Error connecting to MySQL: {err}")
+        return None
+
+def init_db():
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT,
+                    stripe_session_id VARCHAR(255),
+                    amount DECIMAL(10,2),
+                    status VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        st.warning(f"Database initialization delayed or failed: {e}")
+
+init_db()
+
+
+def check_payment_status():
+    if "session_id" in st.query_params:
+        session_id = st.query_params["session_id"]
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+            if session.payment_status == "paid":
+                # client_reference_id contains user_int_id
+                user_int_id = int(session.client_reference_id) if session.client_reference_id else None
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT * FROM payments WHERE stripe_session_id = %s", (session_id,))
+                    if not cursor.fetchone():
+                        cursor.execute("INSERT INTO payments (user_id, stripe_session_id, amount, status) VALUES (%s, %s, %s, %s)",
+                                       (user_int_id, session_id, session.amount_total / 100.0, "paid"))
+                        conn.commit()
+                        firestore_db.collection("payments").add({
+                            "user_id": user_int_id,
+                            "stripe_session_id": session_id,
+                            "amount": session.amount_total / 100.0,
+                            "status": "paid",
+                            "created_at": datetime.utcnow()
+                        })
+                    cursor.close()
+                    conn.close()
+                st.session_state.payment_success = True
+        except Exception as e:
+            st.error(f"Error verifying payment: {e}")
+        
+        st.query_params.clear()
 
 # google login
 def google_login_flow():
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    
+    # Ensure redirect_uri matches BASE_URL
     flow = Flow.from_client_secrets_file(
         "firebase/credit-card-client_secret.json",
         scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
-        redirect_uri="http://localhost:8501/"
+        redirect_uri=BASE_URL
     )
+
 
     if "code" in st.query_params:
         # get user info from google
@@ -112,8 +259,21 @@ def google_login_flow():
             user_name = users[0].to_dict()["name"]
             user_int_id = users[0].to_dict().get("user_id")
         else:
-            # new user, assign next user_id as primary key
-            user_int_id = get_next_user_id()
+            # new user, insert into MySQL first to get id
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                sql = "INSERT INTO users (name, email, phone, password, role) VALUES (%s, %s, %s, %s, %s)"
+                val = (name, email, "", "", "user")
+                cursor.execute(sql, val)
+                user_int_id = cursor.lastrowid
+                conn.commit()
+                cursor.close()
+                conn.close()
+            else:
+                st.error("Could not connect to database")
+                st.stop()
+
             doc = firestore_db.collection("users").add({
                 "user_id": user_int_id,
                 "name": name,
@@ -186,7 +346,20 @@ def register():
         if users:
             st.error("User already exists")
         else:
-            user_int_id = get_next_user_id()
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                sql = "INSERT INTO users (name, email, phone, password, role) VALUES (%s, %s, %s, %s, %s)"
+                val = (name, email, phone, hash_password(password), "user")
+                cursor.execute(sql, val)
+                user_int_id = cursor.lastrowid
+                conn.commit()
+                cursor.close()
+                conn.close()
+            else:
+                st.error("Could not connect to database")
+                st.stop()
+
             doc = firestore_db.collection("users").add({
                 "user_id": user_int_id,
                 "name": name,
@@ -205,53 +378,224 @@ def dashboard():
     st.title("Fraud Detection Dashboard")
     st.sidebar.success("Welcome " + st.session_state.user_name)
 
+    if st.sidebar.button("Prediction History"):
+        st.session_state.view_history = True
+
     if st.sidebar.button("Logout"):
         st.session_state.clear()
         st.rerun()
 
-    transaction_time = st.number_input("Transaction Time", min_value=0, step=1)
-    amount = st.number_input("Amount", min_value=0, step=1)
-    international = st.selectbox("International", [0, 1])
+    if st.session_state.get("view_history"):
+        st.subheader("All Users Prediction History")
+        if st.button("Back to Prediction"):
+            st.session_state.view_history = False
+            st.rerun()
+            
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor(dictionary=True)
+            sql = "SELECT customer_id as user_id, amount, is_international as international, fraud_prediction as prediction, fraud_probability as risk_score, created_at FROM reports ORDER BY created_at DESC"
+            cursor.execute(sql)
+            history_data = cursor.fetchall()
+            cursor.close()
+            conn.close()
 
-    if st.button("Predict", use_container_width=True):
-        # prepare input and run model
-        amount_log = np.log1p(amount)
-        input_data = np.array([[transaction_time, amount_log]])
-        input_scaled = scaler.transform(input_data)
-        probability = model.predict_proba(input_scaled)[0][1]
-
-        # ml based label
-        if probability >= 0.75:
-            final_label = "FRAUD"
-        elif probability >= 0.40:
-            final_label = "SUSPICIOUS"
+            if history_data:
+                st.dataframe(history_data, use_container_width=True)
+            else:
+                st.info("No prediction history found.")
         else:
-            final_label = "SAFE"
+            st.error("Could not connect to database")
+    else:
+        # Check prediction limit and payment
+        can_predict = False
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM reports WHERE customer_id = %s", (st.session_state.get("user_int_id"),))
+            pred_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM payments WHERE user_id = %s AND status = 'paid'", (st.session_state.get("user_int_id"),))
+            payment_count = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            if payment_count > 0 or pred_count < 3:
+                can_predict = True
 
-        # rule based override for high risk cases
-        if amount > 200000 and (international == 1 or transaction_time < 4):
-            final_label = "HIGH RISK FRAUD"
-        elif amount > 100000 and international == 1:
-            final_label = "FRAUD"
+        if not can_predict:
+            st.warning("You have reached the free limit of 3 predictions. Please subscribe to continue.")
+            st.markdown("### Choose a Subscription Plan")
+            col1, col2, col3 = st.columns(3)
+            
+            plans = [
+                {"name": "Weekly Plan", "price": 7, "col": col1},
+                {"name": "Monthly Plan", "price": 25, "col": col2},
+                {"name": "Yearly Plan", "price": 269, "col": col3}
+            ]
+            
+            for plan in plans:
+                with plan["col"]:
+                    st.info(f"**{plan['name']}**  \n${plan['price']}")
+                    try:
+                        checkout_session = stripe.checkout.Session.create(
+                            payment_method_types=['card'],
+                            line_items=[{
+                                'price_data': {
+                                    'currency': 'usd',
+                                    'product_data': {
+                                        'name': f'Fraud Detection {plan["name"]}',
+                                    },
+                                    'unit_amount': plan['price'] * 100,
+                                },
+                                'quantity': 1,
+                            }],
+                            mode='payment',
+                            success_url=f'{BASE_URL}?session_id={{CHECKOUT_SESSION_ID}}',
+                            cancel_url=BASE_URL,
+                            client_reference_id=str(st.session_state.get("user_int_id"))
 
-        risk_score = round(probability * 100, 1)
+                        )
+                        st.markdown(f'<a href="{checkout_session.url}" target="_self" style="text-decoration:none;"><button style="width:100%;height:40px;border-radius:20px;border:none;background:linear-gradient(90deg,#5bc8d4,#b44fc8);color:white;font-weight:700;font-size:14px;cursor:pointer;">Subscribe</button></a>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"Error initiating payment: {e}")
+            st.stop()
+            
+        st.subheader("Transaction & Verification Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            transaction_time = st.number_input("Transaction Time (in hrs)", min_value=0, step=1)
+            amount = st.number_input("Amount", min_value=0, step=1)
+            international = st.selectbox("International", [0, 1])
+        with col2:
+            st.markdown("**(New) Verification Info**")
+            credit_card = st.text_input("Credit Card Number (optional)")
+            phone = st.text_input("Customer Phone (optional)", placeholder="e.g. +91XXXXXXXXXX")
+            upi = st.text_input("UPI ID (optional)", placeholder="user@bank")
+            email = st.text_input("Customer Email (optional)")
+            credit_score = st.number_input("Credit Score (0 if unknown)", min_value=0, max_value=900, value=0, step=1)
 
-        # save result to firestore
-        firestore_db.collection("reports").add({
-            "user_id": st.session_state.get("user_int_id"),
-            "amount": amount,
-            "is_international": international,
-            "fraud_prediction": final_label,
-            "fraud_probability": risk_score,
-            "created_at": datetime.utcnow()
-        })
+        if st.button("Predict", use_container_width=True):
+            # prepare input and run ML model
+            amount_log = np.log1p(amount)
+            input_data = np.array([[transaction_time, amount_log]])
+            input_scaled = scaler.transform(input_data)
+            probability = model.predict_proba(input_scaled)[0][1]
 
-        st.success("Prediction: " + final_label)
-        st.metric("Risk Score", str(risk_score) + "/100")
+            risk_score = float(probability * 100)
+            
+            # --- REAL WORLD VALIDATION LOGIC ---
+            validation_messages = []
+            
+            if credit_card:
+                if not is_luhn_valid(credit_card):
+                    risk_score += 40
+                    validation_messages.append("❌ Invalid Credit Card (Luhn check failed)")
+                else:
+                    validation_messages.append("✅ Credit Card Valid (Luhn check passed)")
+
+            if phone:
+                if not is_phone_valid(phone):
+                    risk_score += 20
+                    validation_messages.append("❌ Invalid Phone Number format or telecom info")
+                else:
+                    validation_messages.append("✅ Phone Number Valid")
+
+            if upi:
+                if not is_upi_valid(upi):
+                    risk_score += 25
+                    validation_messages.append("❌ Invalid UPI ID format")
+                else:
+                    validation_messages.append("✅ UPI ID format valid")
+
+            if email:
+                is_valid, msg = check_email_domain(email)
+                if not is_valid:
+                    risk_score += 30
+                    validation_messages.append(f"❌ Email Risk: {msg}")
+                else:
+                    validation_messages.append("✅ Email Valid")
+                    
+            if credit_score > 0:
+                if credit_score < 550:
+                    risk_score += 20
+                    validation_messages.append(f"❌ Low Credit Score ({credit_score}): Risk Increased")
+                elif credit_score < 650:
+                    risk_score += 10
+                    validation_messages.append(f"⚠️ Fair Credit Score ({credit_score}): Slight Risk")
+                else:
+                    risk_score -= 10
+                    validation_messages.append(f"✅ Good Credit Score ({credit_score}): Risk Decreased")
+                    
+            # Ensure risk score is capped at 0 and 100
+            risk_score = max(0.0, min(risk_score, 100.0))
+
+            # Assign Label based on new Risk Score
+            if risk_score >= 80:
+                final_label = "HIGH RISK FRAUD"
+            elif risk_score >= 60:
+                final_label = "FRAUD"
+            elif risk_score >= 40:
+                final_label = "SUSPICIOUS"
+            else:
+                final_label = "SAFE"
+
+            # rule based override for extreme numeric values (legacy)
+            if amount > 200000 and (international == 1 or transaction_time < 4):
+                final_label = "HIGH RISK FRAUD"
+                risk_score = max(risk_score, 95.0)
+            elif amount > 100000 and international == 1:
+                final_label = "FRAUD"
+                risk_score = max(risk_score, 85.0)
+            
+            risk_score = round(risk_score, 1)
+
+            # Display messages
+            with st.expander("Validation Details (Real-World Checks)", expanded=True):
+                if validation_messages:
+                    for msg in validation_messages:
+                        st.markdown(msg)
+                else:
+                    st.info("No advanced validation fields provided.")
+
+            # save result to firestore
+            firestore_db.collection("reports").add({
+                "user_id": st.session_state.get("user_int_id"),
+                "amount": amount,
+                "is_international": international,
+                "fraud_prediction": final_label,
+                "fraud_probability": risk_score,
+                "cc_provided": bool(credit_card),
+                "phone_provided": bool(phone),
+                "upi_provided": bool(upi),
+                "email_provided": bool(email),
+                "credit_score": credit_score,
+                "created_at": datetime.utcnow()
+            })
+
+            # save result to MySQL
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                sql = "INSERT INTO reports (customer_id, amount, is_international, fraud_prediction, fraud_probability) VALUES (%s, %s, %s, %s, %s)"
+                val = (st.session_state.get("user_int_id"), amount, international, final_label, risk_score)
+                cursor.execute(sql, val)
+                conn.commit()
+                cursor.close()
+                conn.close()
+
+            st.success("Prediction: " + final_label)
+            st.metric("Risk Score", str(risk_score) + "/100")
 
 # routing
 if "page" not in st.session_state:
     st.session_state.page = "home"
+
+check_payment_status()
+
+if "payment_success" in st.session_state and st.session_state.payment_success:
+    st.success("Payment successful! You now have unlimited predictions.")
+    st.session_state.payment_success = False
 
 if st.session_state.get("user_id"):
     dashboard()

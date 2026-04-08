@@ -6,3 +6,6 @@ requests
 numpy
 python-dotenv
 scikit-learn
+stripe
+phonenumbers
+email-validator
