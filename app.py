@@ -14,6 +14,10 @@ from datetime import datetime
 import re
 import phonenumbers
 from email_validator import validate_email, EmailNotValidError
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import json
 
 load_dotenv()
 
@@ -31,8 +35,21 @@ missing_vars = check_required_env()
 st.set_page_config(page_title="Credit Card Fraud Detection", layout="centered")
 
 # Determine Base URL for redirects
-# On Render, we can use the environment variable RENDER_EXTERNAL_URL if set, or default to localhost
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8501").rstrip("/") + "/"
+# Priority: APP_URL (Manual) > RAILWAY_PUBLIC_DOMAIN > RENDER_EXTERNAL_URL > Localhost
+APP_URL = os.getenv("APP_URL")
+RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+if APP_URL:
+    BASE_URL = APP_URL
+elif RAILWAY_DOMAIN:
+    BASE_URL = f"https://{RAILWAY_DOMAIN}"
+elif RENDER_URL:
+    BASE_URL = RENDER_URL
+else:
+    BASE_URL = "http://localhost:8501"
+
+BASE_URL = BASE_URL.rstrip("/") + "/"
 
 
 # page styling
@@ -99,6 +116,63 @@ try:
 except Exception as e:
     st.error(f"Firebase Initialization Error: {e}")
     firestore_db = None
+
+
+# --- POSTGRES DATABASE SETUP (RAILWAY) ---
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(100), nullable=False, unique=True)
+    phone = Column(String(20))
+    password = Column(String(255))
+    role = Column(String(20), default='user')
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Report(Base):
+    __tablename__ = 'reports'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(100), nullable=False) # Store as string to handle both ID types
+    amount = Column(Float, nullable=False)
+    is_international = Column(Integer, nullable=False)
+    fraud_prediction = Column(String(50), nullable=False)
+    fraud_probability = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Payment(Base):
+    __tablename__ = 'payments'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(100), nullable=False)
+    stripe_session_id = Column(String(255), nullable=False)
+    amount = Column(Float, nullable=False)
+    status = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    # Fix for Railway/Heroku postgres:// vs postgresql://
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db_available = True
+else:
+    db_available = False
+    st.warning("Postgres Database URL not found. Falling back to Firebase only.")
+
+def get_db():
+    if not db_available:
+        return None
+    db = SessionLocal()
+    try:
+        return db
+    except:
+        db.close()
+        return None
 
 
 # load model and scaler
@@ -170,13 +244,24 @@ def check_payment_status():
                 existing_payments = firestore_db.collection("payments").where("stripe_session_id", "==", session_id).get()
                 if not existing_payments:
                     user_id = session.client_reference_id
-                    firestore_db.collection("payments").add({
+                    payment_data = {
                         "user_id": user_id,
                         "stripe_session_id": session_id,
                         "amount": session.amount_total / 100.0,
                         "status": "paid",
                         "created_at": datetime.utcnow()
-                    })
+                    }
+                    # Save to Firestore
+                    firestore_db.collection("payments").add(payment_data)
+                    
+                    # Save to Postgres
+                    db = get_db()
+                    if db:
+                        new_payment = Payment(**payment_data)
+                        db.add(new_payment)
+                        db.commit()
+                        db.close()
+
                 st.session_state.payment_success = True
         except Exception as e:
             st.error(f"Error verifying payment: {e}")
@@ -184,20 +269,49 @@ def check_payment_status():
         st.query_params.clear()
 
 # google login
+@st.cache_resource
+def get_oauth_cache():
+    return {}
+
 def google_login_flow():
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     
     # Ensure redirect_uri matches BASE_URL
-    flow = Flow.from_client_secrets_file(
-        "firebase/credit-card-client_secret.json",
-        scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
-        redirect_uri=BASE_URL
-    )
+    client_secret_path = "firebase/credit-card-client_secret.json"
+    
+    # Check if client secrets are in environment variables (for safer deployment)
+    google_client_json = os.getenv("GOOGLE_CLIENT_SECRETS_JSON")
+    
+    if google_client_json:
+        import json
+        client_config = json.loads(google_client_json)
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
+            redirect_uri=BASE_URL
+        )
+    elif os.path.exists(client_secret_path):
+        flow = Flow.from_client_secrets_file(
+            client_secret_path,
+            scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
+            redirect_uri=BASE_URL
+        )
+    else:
+        st.error("Google Client Secrets not found. Please set GOOGLE_CLIENT_SECRETS_JSON env var or upload the JSON file.")
+        st.stop()
 
+    oauth_cache = get_oauth_cache()
 
     if "code" in st.query_params:
         # get user info from google
-        flow.fetch_token(code=st.query_params["code"])
+        received_state = st.query_params.get("state")
+        code_verifier = oauth_cache.get(received_state) if received_state else None
+        
+        if code_verifier:
+            flow.fetch_token(code=st.query_params["code"], code_verifier=code_verifier)
+        else:
+            flow.fetch_token(code=st.query_params["code"])
+            
         creds_google = flow.credentials
         user_info = requests.get(
             "https://www.googleapis.com/oauth2/v1/userinfo",
@@ -213,17 +327,27 @@ def google_login_flow():
             user_id = users[0].id
             user_name = users[0].to_dict()["name"]
         else:
-            # new user - only Firestore
-            doc_ref = firestore_db.collection("users").add({
+            # new user - save to both
+            user_data = {
                 "name": name,
                 "email": email,
                 "phone": "",
                 "password": "",
                 "role": "user",
                 "created_at": datetime.utcnow()
-            })
+            }
+            # Firestore
+            doc_ref = firestore_db.collection("users").add(user_data)
             user_id = doc_ref[1].id
             user_name = name
+            
+            # Postgres
+            db = get_db()
+            if db:
+                new_user = User(**user_data)
+                db.add(new_user)
+                db.commit()
+                db.close()
 
         st.session_state.user_id = user_id
         st.session_state.user_name = user_name
@@ -232,7 +356,9 @@ def google_login_flow():
 
     else:
         # show google login button
-        auth_url, _ = flow.authorization_url(prompt="consent")
+        auth_url, state = flow.authorization_url(prompt="consent")
+        oauth_cache[state] = getattr(flow, "code_verifier", None)
+        
         st.markdown(f"""
         <a href="{auth_url}" class="google-btn">
         <svg class="google-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -283,14 +409,25 @@ def register():
         if users:
             st.error("User already exists")
         else:
-            doc_ref = firestore_db.collection("users").add({
+            user_data = {
                 "name": name,
                 "email": email,
                 "phone": phone,
                 "password": hash_password(password),
                 "role": "user",
                 "created_at": datetime.utcnow()
-            })
+            }
+            # Firestore
+            doc_ref = firestore_db.collection("users").add(user_data)
+            
+            # Postgres
+            db = get_db()
+            if db:
+                new_user = User(**user_data)
+                db.add(new_user)
+                db.commit()
+                db.close()
+                
             st.success("Account Created Successfully")
             st.session_state.page = "home"
             st.rerun()
@@ -313,11 +450,28 @@ def dashboard():
             st.session_state.view_history = False
             st.rerun()
             
-        # Fetch from Firestore
-        reports_ref = firestore_db.collection("reports").order_by("created_at", direction=firestore.Query.DESCENDING).get()
-        history_data = [doc.to_dict() for doc in reports_ref]
-
-        if history_data:
+        # Fetch history
+        history_data = []
+        db = get_db()
+        if db:
+            # Try Postgres first
+            reports = db.query(Report).order_by(Report.created_at.desc()).all()
+            history_data = [
+                {
+                    "user_id": r.user_id,
+                    "amount": r.amount,
+                    "international": r.is_international,
+                    "prediction": r.fraud_prediction,
+                    "risk_score": r.fraud_probability,
+                    "created_at": r.created_at
+                } for r in reports
+            ]
+            db.close()
+        
+        if not history_data:
+            # Fallback to Firestore
+            reports_ref = firestore_db.collection("reports").order_by("created_at", direction=firestore.Query.DESCENDING).get()
+            history_data = [doc.to_dict() for doc in reports_ref]
             # Map for display
             display_data = []
             for d in history_data:
@@ -329,21 +483,32 @@ def dashboard():
                     "risk_score": d.get("fraud_probability"),
                     "created_at": d.get("created_at")
                 })
-            st.dataframe(display_data, use_container_width=True)
+            history_data = display_data
+
+        if history_data:
+            st.dataframe(history_data, use_container_width=True)
         else:
             st.info("No prediction history found.")
     else:
         # Check prediction limit and payment from Firestore
         can_predict = False
         user_id = st.session_state.get("user_id")
+        pred_count = 0
+        payment_count = 0
         
-        # Count user's reports
-        pred_docs = firestore_db.collection("reports").where("user_id", "==", user_id).get()
-        pred_count = len(pred_docs)
-        
-        # Check if user has any 'paid' status in payments
-        payment_docs = firestore_db.collection("payments").where("user_id", "==", user_id).where("status", "==", "paid").get()
-        payment_count = len(payment_docs)
+        db = get_db()
+        if db:
+            pred_count = db.query(Report).filter(Report.user_id == user_id).count()
+            payment_count = db.query(Payment).filter(Payment.user_id == user_id, Payment.status == 'paid').count()
+            db.close()
+        else:
+            # Count user's reports in Firestore
+            pred_docs = firestore_db.collection("reports").where("user_id", "==", user_id).get()
+            pred_count = len(pred_docs)
+            
+            # Check if user has any 'paid' status in payments in Firestore
+            payment_docs = firestore_db.collection("payments").where("user_id", "==", user_id).where("status", "==", "paid").get()
+            payment_count = len(payment_docs)
         
         if payment_count > 0 or pred_count < 3:
             can_predict = True
@@ -385,21 +550,56 @@ def dashboard():
                         st.error(f"Error initiating payment: {e}")
             st.stop()
             
-        st.subheader("Transaction & Verification Details")
-        col1, col2 = st.columns(2)
-        with col1:
-            transaction_time = st.number_input("Transaction Time (in hrs)", min_value=0, step=1)
-            amount = st.number_input("Amount", min_value=0, step=1)
-            international = st.selectbox("International", [0, 1])
-        with col2:
-            st.markdown("**(New) Verification Info**")
-            credit_card = st.text_input("Credit Card Number (optional)")
-            phone = st.text_input("Customer Phone (optional)", placeholder="e.g. +91XXXXXXXXXX")
-            upi = st.text_input("UPI ID (optional)", placeholder="user@bank")
-            email = st.text_input("Customer Email (optional)")
-            credit_score = st.number_input("Credit Score (0 if unknown)", min_value=0, max_value=900, value=0, step=1)
+        st.subheader("Real-World Fraud Assessment Parameters")
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "1. Transaction", "2. Identity & Device", "3. CNP Verification", "4. Threat Intel", "5. Account Security"
+        ])
 
-        if st.button("Predict", use_container_width=True):
+        with tab1:
+            st.markdown("##### 1. Transaction Behavioral Anomalies")
+            col1, col2 = st.columns(2)
+            with col1:
+                transaction_time = st.number_input("Transaction Time (in hrs)", min_value=0, step=1)
+                amount = st.number_input("Amount", min_value=0, step=1)
+                international = st.selectbox("International", [0, 1], help="0: Local, 1: International")
+            with col2:
+                merchant_type = st.selectbox("Merchant Type", ["General Retail", "Grocery", "Online Storage", "Crypto Exchange", "Luxury Goods", "Unknown"])
+                location_consistency = st.selectbox("Location Consistency", ["Consistent", "Out-of-State", "Different Country", "Impossible Travel (High Velocity)"])
+                velocity = st.number_input("Transactions in Last 12h", min_value=0, step=1, value=1)
+
+        with tab2:
+            st.markdown("##### 2. Digital Identity & Device Fingerprinting")
+            col3, col4 = st.columns(2)
+            with col3:
+                device_fingerprint = st.selectbox("Device Fingerprint", ["Recognized Device", "New Unrecognized Device", "Suspicious (Tor/VPN/Proxy)", "Emulator Detected"])
+                credit_score = st.number_input("Credit Score (0 if unknown)", min_value=0, max_value=900, value=0, step=1)
+            with col4:
+                behavioral_score = st.slider("Behavioral Biometrics Score", 0, 100, 85, help="Matches typing speed, mouse patterns, etc. < 30 is suspicious.")
+                email = st.text_input("Customer Email (optional)")
+                phone = st.text_input("Customer Phone (optional)", placeholder="e.g. +91XXXXXXXXXX")
+
+        with tab3:
+            st.markdown("##### 3. Card-Not-Present (CNP) Verification")
+            col5, col6 = st.columns(2)
+            with col5:
+                credit_card = st.text_input("Credit Card Number (optional)")
+                upi = st.text_input("UPI ID (optional)", placeholder="user@bank")
+            with col6:
+                cvv_match = st.radio("CVV Match?", ["Matched", "Failed"])
+                avs_match = st.radio("AVS (Address) Match?", ["Matched", "Failed", "Partial"])
+                micro_transactions = st.checkbox("Micro-transactions Detected (Card Testing)", value=False)
+
+        with tab4:
+            st.markdown("##### 4. Third-Party Intelligence")
+            dark_web = st.checkbox("Dark Web Monitoring Hit (Card data found in leaked dumps)", value=False)
+            e_skimming = st.checkbox("E-Skimming Detection (Merchant flagged for Magecart)", value=False)
+
+        with tab5:
+            st.markdown("##### 5. Account Takeover (ATO) Indicators")
+            profile_changes = st.checkbox("Recent Profile Changes (Email/Phone changed < 24h ago)", value=False)
+            failed_otps = st.number_input("Recent Failed OTP Validations", min_value=0, max_value=10, value=0, step=1)
+
+        if st.button("Predict Fraud Risk", use_container_width=True):
             # prepare input and run ML model
             amount_log = np.log1p(amount)
             input_data = np.array([[transaction_time, amount_log]])
@@ -450,7 +650,80 @@ def dashboard():
                 else:
                     risk_score -= 10
                     validation_messages.append(f"✅ Good Credit Score ({credit_score}): Risk Decreased")
-                    
+
+            # --- NEW REAL-WORLD INDICATORS ---
+            
+            # 1. Transaction Behavior
+            if merchant_type in ["Crypto Exchange", "Luxury Goods"]:
+                risk_score += 15
+                validation_messages.append(f"⚠️ High-Risk Merchant Category: {merchant_type}")
+                
+            if location_consistency == "Different Country":
+                risk_score += 20
+                validation_messages.append("⚠️ Geographical Anomaly: Transaction from a different country")
+            elif location_consistency == "Impossible Travel (High Velocity)":
+                risk_score += 40
+                validation_messages.append("❌ Extreme Geographical Anomaly: Impossible travel time detected")
+                
+            if velocity > 5 and velocity <= 10:
+                risk_score += 20
+                validation_messages.append("⚠️ Velocity Check: High number of recent transactions")
+            elif velocity > 10:
+                risk_score += 40
+                validation_messages.append("❌ Velocity Check: Rapid burst of transactions (Automated testing suspected)")
+
+            # 2. Digital Identity & Device
+            if device_fingerprint in ["Suspicious (Tor/VPN/Proxy)", "Emulator Detected"]:
+                risk_score += 40
+                validation_messages.append(f"❌ Device Anomaly: {device_fingerprint}")
+            elif device_fingerprint == "New Unrecognized Device":
+                risk_score += 10
+                validation_messages.append("⚠️ Device Anomaly: New unrecognized device")
+                
+            if behavioral_score < 30:
+                risk_score += 30
+                validation_messages.append(f"❌ Behavioral Biometrics: Score extremely low ({behavioral_score}), bot or account takeover suspected")
+            elif behavioral_score < 60:
+                risk_score += 10
+                validation_messages.append(f"⚠️ Behavioral Biometrics: Unusual input patterns ({behavioral_score})")
+
+            # 3. CNP Verification
+            if cvv_match == "Failed":
+                risk_score += 40
+                validation_messages.append("❌ Verification Failure: CVV mismatch")
+                
+            if avs_match == "Failed":
+                risk_score += 20
+                validation_messages.append("⚠️ Verification Failure: AVS (Address) mismatch")
+            elif avs_match == "Partial":
+                risk_score += 10
+                validation_messages.append("⚠️ Verification Failure: Partial AVS mismatch")
+                
+            if micro_transactions:
+                risk_score += 50
+                validation_messages.append("❌ Card Testing: Rapid micro-transactions detected")
+
+            # 4. Third-Party Intelligence
+            if dark_web:
+                risk_score = max(risk_score + 80, 95)
+                validation_messages.append("🚨 THREAT INTEL: Card details found in Dark Web dumps!")
+                
+            if e_skimming:
+                risk_score += 50
+                validation_messages.append("🚨 THREAT INTEL: E-Skimming (Magecart) detected on merchant checkout page!")
+
+            # 5. Account Takeover (ATO)
+            if profile_changes:
+                risk_score += 30
+                validation_messages.append("❌ ATO Indicator: Suspicious recent profile changes (Email/Phone)")
+                
+            if failed_otps >= 3:
+                risk_score += 40
+                validation_messages.append(f"❌ ATO Indicator: {failed_otps} failed OTP attempts")
+            elif failed_otps > 0:
+                risk_score += 15
+                validation_messages.append(f"⚠️ ATO Indicator: {failed_otps} failed OTP attempts")
+
             # Ensure risk score is capped at 0 and 100
             risk_score = max(0.0, min(risk_score, 100.0))
 
@@ -482,20 +755,32 @@ def dashboard():
                 else:
                     st.info("No advanced validation fields provided.")
 
-            # save result to firestore
-            firestore_db.collection("reports").add({
+            # save result to both
+            report_data = {
                 "user_id": st.session_state.get("user_id"),
                 "amount": amount,
                 "is_international": international,
                 "fraud_prediction": final_label,
                 "fraud_probability": risk_score,
+                "created_at": datetime.utcnow()
+            }
+            # Firestore
+            firestore_db.collection("reports").add({
+                **report_data,
                 "cc_provided": bool(credit_card),
                 "phone_provided": bool(phone),
                 "upi_provided": bool(upi),
                 "email_provided": bool(email),
                 "credit_score": credit_score,
-                "created_at": datetime.utcnow()
             })
+            
+            # Postgres
+            db = get_db()
+            if db:
+                new_report = Report(**report_data)
+                db.add(new_report)
+                db.commit()
+                db.close()
 
             # MySQL save removed
 

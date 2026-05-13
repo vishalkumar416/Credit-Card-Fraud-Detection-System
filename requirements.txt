@@ -7,4 +7,6 @@ python-dotenv
 scikit-learn
 stripe
 phonenumbers
-email-validator
+email-validator
+sqlalchemy
+psycopg2-binary
