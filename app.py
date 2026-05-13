@@ -180,11 +180,32 @@ if not os.path.exists("model"):
     os.makedirs("model")
 
 if not os.path.exists("model/model.pkl"):
-    with zipfile.ZipFile("model.zip", "r") as zip_ref:
-        zip_ref.extractall("model")
+    if os.path.exists("model.zip"):
+        # Check if it's a Git LFS pointer
+        with open("model.zip", "rb") as f:
+            header = f.read(100)
+            if b"version https://git-lfs" in header:
+                st.error("📂 **Model file is a Git LFS pointer.**")
+                st.info("The actual model file was not downloaded during deployment. Please ensure Git LFS is enabled in your deployment settings or use the provided `nixpacks.toml`.")
+                st.stop()
+        
+        try:
+            with zipfile.ZipFile("model.zip", "r") as zip_ref:
+                zip_ref.extractall("model")
+        except zipfile.BadZipFile:
+            st.error("❌ **Invalid model.zip file detected.**")
+            st.warning("The file might be corrupted or is an LFS pointer that wasn't properly downloaded.")
+            st.stop()
+    else:
+        st.error("❌ **model.zip not found!**")
+        st.stop()
 
-model = pickle.load(open("model/model.pkl", "rb"))
-scaler = pickle.load(open("model/scaler.pkl", "rb"))
+try:
+    model = pickle.load(open("model/model.pkl", "rb"))
+    scaler = pickle.load(open("model/scaler.pkl", "rb"))
+except Exception as e:
+    st.error(f"❌ Error loading model files: {e}")
+    st.stop()
 
 def is_luhn_valid(card_num):
     card_num = str(card_num).replace(" ", "").replace("-", "")
