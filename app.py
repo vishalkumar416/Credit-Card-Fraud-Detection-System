@@ -14,9 +14,6 @@ from datetime import datetime
 import re
 import phonenumbers
 from email_validator import validate_email, EmailNotValidError
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 import json
 
 load_dotenv()
@@ -35,19 +32,13 @@ missing_vars = check_required_env()
 st.set_page_config(page_title="Credit Card Fraud Detection", layout="centered")
 
 # Determine Base URL for redirects
-# Priority: APP_URL (Manual) > RAILWAY_PUBLIC_DOMAIN > RENDER_EXTERNAL_URL > Localhost
+# Priority: APP_URL (Manual) > Localhost
 APP_URL = os.getenv("APP_URL")
-RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 if APP_URL:
     BASE_URL = APP_URL
-elif RAILWAY_DOMAIN:
-    BASE_URL = f"https://{RAILWAY_DOMAIN}"
-elif RENDER_URL:
-    BASE_URL = RENDER_URL
 else:
-    BASE_URL = "http://localhost:8501"
+    BASE_URL = "http://127.0.0.1:8501"
 
 BASE_URL = BASE_URL.rstrip("/") + "/"
 
@@ -84,9 +75,7 @@ box-sizing:border-box;margin-top:4px;margin-bottom:4px;
 # Show error if env vars are missing
 if missing_vars:
     st.error(f"⚠️ Missing Environment Variables: {', '.join(missing_vars)}")
-    st.info("Please set these variables in your Render Dashboard or .env file.")
-    if not os.getenv("RENDER_EXTERNAL_URL"): # Only stop if local and missing, or maybe just warn on Render
-        st.warning("The application may not function correctly.")
+    st.info("Please set these variables in your .env file.")
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
@@ -118,61 +107,6 @@ except Exception as e:
     firestore_db = None
 
 
-# --- POSTGRES DATABASE SETUP (RAILWAY) ---
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(100), nullable=False, unique=True)
-    phone = Column(String(20))
-    password = Column(String(255))
-    role = Column(String(20), default='user')
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Report(Base):
-    __tablename__ = 'reports'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String(100), nullable=False) # Store as string to handle both ID types
-    amount = Column(Float, nullable=False)
-    is_international = Column(Integer, nullable=False)
-    fraud_prediction = Column(String(50), nullable=False)
-    fraud_probability = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Payment(Base):
-    __tablename__ = 'payments'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String(100), nullable=False)
-    stripe_session_id = Column(String(255), nullable=False)
-    amount = Column(Float, nullable=False)
-    status = Column(String(50), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL:
-    # Fix for Railway/Heroku postgres:// vs postgresql://
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    
-    engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(bind=engine)
-    db_available = True
-else:
-    db_available = False
-    st.warning("Postgres Database URL not found. Falling back to Firebase only.")
-
-def get_db():
-    if not db_available:
-        return None
-    db = SessionLocal()
-    try:
-        return db
-    except:
-        db.close()
-        return None
 
 
 # load model and scaler
@@ -186,7 +120,7 @@ if not os.path.exists("model/model.pkl"):
             header = f.read(100)
             if b"version https://git-lfs" in header:
                 st.error("📂 **Model file is a Git LFS pointer.**")
-                st.info("The actual model file was not downloaded during deployment. Please ensure Git LFS is enabled in your deployment settings or use the provided `nixpacks.toml`.")
+                st.info("The actual model file was not downloaded. Please ensure Git LFS is installed and you have run `git lfs pull`.")
                 st.stop()
         
         try:
@@ -195,6 +129,7 @@ if not os.path.exists("model/model.pkl"):
         except zipfile.BadZipFile:
             st.error("❌ **Invalid model.zip file detected.**")
             st.warning("The file might be corrupted or is an LFS pointer that wasn't properly downloaded.")
+            st.info("Ensure Git LFS is properly configured locally.")
             st.stop()
     else:
         st.error("❌ **model.zip not found!**")
@@ -275,13 +210,6 @@ def check_payment_status():
                     # Save to Firestore
                     firestore_db.collection("payments").add(payment_data)
                     
-                    # Save to Postgres
-                    db = get_db()
-                    if db:
-                        new_payment = Payment(**payment_data)
-                        db.add(new_payment)
-                        db.commit()
-                        db.close()
 
                 st.session_state.payment_success = True
         except Exception as e:
@@ -362,13 +290,7 @@ def google_login_flow():
             user_id = doc_ref[1].id
             user_name = name
             
-            # Postgres
-            db = get_db()
-            if db:
-                new_user = User(**user_data)
-                db.add(new_user)
-                db.commit()
-                db.close()
+            
 
         st.session_state.user_id = user_id
         st.session_state.user_name = user_name
@@ -441,13 +363,7 @@ def register():
             # Firestore
             doc_ref = firestore_db.collection("users").add(user_data)
             
-            # Postgres
-            db = get_db()
-            if db:
-                new_user = User(**user_data)
-                db.add(new_user)
-                db.commit()
-                db.close()
+            
                 
             st.success("Account Created Successfully")
             st.session_state.page = "home"
@@ -471,40 +387,19 @@ def dashboard():
             st.session_state.view_history = False
             st.rerun()
             
-        # Fetch history
+        # Fetch history from Firestore
+        reports_ref = firestore_db.collection("reports").order_by("created_at", direction=firestore.Query.DESCENDING).get()
         history_data = []
-        db = get_db()
-        if db:
-            # Try Postgres first
-            reports = db.query(Report).order_by(Report.created_at.desc()).all()
-            history_data = [
-                {
-                    "user_id": r.user_id,
-                    "amount": r.amount,
-                    "international": r.is_international,
-                    "prediction": r.fraud_prediction,
-                    "risk_score": r.fraud_probability,
-                    "created_at": r.created_at
-                } for r in reports
-            ]
-            db.close()
-        
-        if not history_data:
-            # Fallback to Firestore
-            reports_ref = firestore_db.collection("reports").order_by("created_at", direction=firestore.Query.DESCENDING).get()
-            history_data = [doc.to_dict() for doc in reports_ref]
-            # Map for display
-            display_data = []
-            for d in history_data:
-                display_data.append({
-                    "user_id": d.get("user_id"),
-                    "amount": d.get("amount"),
-                    "international": d.get("is_international"),
-                    "prediction": d.get("fraud_prediction"),
-                    "risk_score": d.get("fraud_probability"),
-                    "created_at": d.get("created_at")
-                })
-            history_data = display_data
+        for doc in reports_ref:
+            d = doc.to_dict()
+            history_data.append({
+                "user_id": d.get("user_id"),
+                "amount": d.get("amount"),
+                "international": d.get("is_international"),
+                "prediction": d.get("fraud_prediction"),
+                "risk_score": d.get("fraud_probability"),
+                "created_at": d.get("created_at")
+            })
 
         if history_data:
             st.dataframe(history_data, use_container_width=True)
@@ -517,19 +412,13 @@ def dashboard():
         pred_count = 0
         payment_count = 0
         
-        db = get_db()
-        if db:
-            pred_count = db.query(Report).filter(Report.user_id == user_id).count()
-            payment_count = db.query(Payment).filter(Payment.user_id == user_id, Payment.status == 'paid').count()
-            db.close()
-        else:
-            # Count user's reports in Firestore
-            pred_docs = firestore_db.collection("reports").where("user_id", "==", user_id).get()
-            pred_count = len(pred_docs)
-            
-            # Check if user has any 'paid' status in payments in Firestore
-            payment_docs = firestore_db.collection("payments").where("user_id", "==", user_id).where("status", "==", "paid").get()
-            payment_count = len(payment_docs)
+        # Count user's reports in Firestore
+        pred_docs = firestore_db.collection("reports").where("user_id", "==", user_id).get()
+        pred_count = len(pred_docs)
+        
+        # Check if user has any 'paid' status in payments in Firestore
+        payment_docs = firestore_db.collection("payments").where("user_id", "==", user_id).where("status", "==", "paid").get()
+        payment_count = len(payment_docs)
         
         if payment_count > 0 or pred_count < 3:
             can_predict = True
@@ -795,13 +684,6 @@ def dashboard():
                 "credit_score": credit_score,
             })
             
-            # Postgres
-            db = get_db()
-            if db:
-                new_report = Report(**report_data)
-                db.add(new_report)
-                db.commit()
-                db.close()
 
             # MySQL save removed
 

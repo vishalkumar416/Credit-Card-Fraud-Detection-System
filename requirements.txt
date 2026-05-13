@@ -8,5 +8,3 @@ scikit-learn
 stripe
 phonenumbers
 email-validator
-sqlalchemy
-psycopg2-binary
